@@ -1,0 +1,13 @@
+Metadata-Version: 1.2
+Name: hw-package-1
+Version: 0.0.1
+Summary: Homework package
+Home-page: UNKNOWN
+Author: Bartek Krzepkowski
+Author-email: b.krzepkowski@student.uw.edu.pl
+License: UNKNOWN
+Description: UNKNOWN
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6

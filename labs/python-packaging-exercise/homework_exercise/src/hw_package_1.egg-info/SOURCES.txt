@@ -1,0 +1,13 @@
+pyproject.toml
+setup.cfg
+setup.py
+src/hw_pack/__init__.py
+src/hw_pack/_calculation.py
+src/hw_pack/_data.py
+src/hw_pack/data_file.json
+src/hw_pack/data_file_2.toml
+src/hw_package_1.egg-info/PKG-INFO
+src/hw_package_1.egg-info/SOURCES.txt
+src/hw_package_1.egg-info/dependency_links.txt
+src/hw_package_1.egg-info/requires.txt
+src/hw_package_1.egg-info/top_level.txt
