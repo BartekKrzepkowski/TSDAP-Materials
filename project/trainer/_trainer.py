@@ -1,26 +1,21 @@
+import copy
+import datetime
 import gc
 import os
-import datetime
-import copy
-import torch
-import pandas as pd
 from collections import ChainMap
 from itertools import product
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
-# from pathlib import Path
 
-from data import Loaders
+import torch
+import pandas as pd
 from clearml import Task
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
-params_clearml = {
-    
-}
-Task.set_credentials(**params_clearml)
+from .utils import save_model
 
 
 class Trainer:
-    def __init__(self, model, loader_train, loader_test, criterion, optim, scheduler=None):
+    def __init__(self, model, loaders, criterion, optim, scheduler=None, params_clearml=None, is_tensorboard=False):
         """
         Trainer initializer. Every argument is a shell of class or method that is initialized in init_run.
 
@@ -30,15 +25,17 @@ class Trainer:
             criterion (torch.nn.NLLLoss): The negative log likelihood loss
             optim (torch.optim.Optimizer): Chosen optimizer
         """
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.model_ = model
-        self.loader_train_ = loader_train
-        self.loader_test_ = loader_test
+        self.loaders_ = loaders
         self.criterion_ = criterion
         self.optim_ = optim
         self.scheduler_ = scheduler
+        self.params_clearml = params_clearml
+        self.is_tensorboard = is_tensorboard
+        if params_clearml:
+            Task.set_credentials(**params_clearml)
 
-    def run_trainer(self, iter_params, epochs, exp_name, log_dir, val_step, dataset_name, device=None):
+    def run_trainer(self, iter_params, epochs, exp_name, val_step, checkpoint_save_step, verbose=False, device=None):
         """
         Main method of trainer.
         Init df -> [Pick run  -> Init Run -> [Run Epoch]_{IL} -> Update df]_{IL} -> Save df -> Plot Results
@@ -52,30 +49,38 @@ class Trainer:
         """
         self.device = device if device else self.device
         self.manual_seed(42)
+        # assign
+        self.checkpoint_save_step = checkpoint_save_step
+        self.verbose = verbose
         self.val_step = val_step
-        base_path = os.path.join(os.getcwd(), f'data/{exp_name}/'
+        self.base_path = os.path.join(os.getcwd(), f'data/{exp_name}/'
                                               f'_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
-        os.makedirs(base_path)
-        # Path(base_path).mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.base_path)
         df_runs = pd.DataFrame()
         for run, params_run in enumerate(iter_params):
             self.init_run(params_run)
-            task = Task.init(project_name=f'{exp_name}', task_name=f'run_{exp_name}_{self.step}')
             params_pooled = self.params_adjust(copy.deepcopy(params_run))
-            self.writer = SummaryWriter()
-            self.writer.add_graph(self.model, torch.zeros((1, 3, 32, 32)).to(self.device))
+            self.date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            os.makedirs(f'{self.base_path}/checkpoints')
+            if self.params_clearml:
+                task = Task.init(project_name=f'{exp_name}', task_name=f'run_{exp_name}_{run}')
+            if self.is_tensorboard :
+                self.writer = SummaryWriter(f'{self.base_path}/tensorboard/{self.date}')
+                inp = next(iter(self.loaders['train']))[0]
+                self.writer.add_graph(self.model, inp.to(self.device))
 
-            
-            self.loop(self.step, self.step + epochs)
+            self.loop(0, epochs)
 
-            self.writer.close()
+            if self.is_tensorboard:
+                self.writer.close()
             df_runs = pd.concat([df_runs, pd.DataFrame({'log loss': self.logs['train_log_loss'],
                                                         'accuracy': self.logs['train_accuracy'],
                                                         'val_log loss': self.logs['test_log_loss'],
                                                         'val_accuracy': self.logs['test_accuracy'],
                                                         **params_pooled}, index=[run])], axis=0)
-            task.close()
-        df_runs.to_csv(f'{base_path}/{exp_name}.csv')
+            if self.params_clearml:
+                task.close()
+        df_runs.to_csv(f'{self.base_path}/{exp_name}.csv')
 
     def loop(self, epochs_start, epochs_end):
         for epoch in tqdm(range(epochs_start, epochs_end)):
@@ -86,17 +91,18 @@ class Trainer:
 
             self.model.eval()
             if (epoch + 1) % self.val_step == 0:
+                phase = 'val' if 'val' in self.loader else 'test'
                 with torch.no_grad():
-                    self.run_epoch('test', epoch)
+                    self.run_epoch(phase, epoch)
 
-            if (epoch + 1) % 10 == 0:
-                print('Entering FIM')
-                self.fim(epoch)
-                print('Leaving FIM')
+            if (epoch + 1) % self.checkpoint_save_step == 0:
+                self.save_net(f'{self.base_path}/checkpoints/{self.date}_epoch_{epoch}.')
 
             if self.scheduler_:
                 self.scheduler.step()
-            gc.collect()
+        with torch.no_grad():
+            self.run_epoch('test', epoch)
+        gc.collect()
 
     def init_run(self, params):
         """Initiate run."""
@@ -106,13 +112,7 @@ class Trainer:
         self.optim = self.optim_(self.model.parameters(), **params['optim'])
         if self.scheduler_:
             self.scheduler = self.scheduler_(self.optim, **params['scheduler'])
-        loader_train = self.loader_train_(**params['loaders'])
-        loader_test = self.loader_test_(**params['loaders'], is_train=False)
-        self.loaders = {
-            'train': loader_train,
-            'test': loader_test
-        }
-        self.step = params['step']['step']
+        self.loaders = self.loaders_(**params['loaders'])
 
 
     def params_adjust(self, params):
@@ -142,7 +142,18 @@ class Trainer:
         self.logs[f'{phase}_log_loss'] = round(epoch_loss, 4)
         self.writer.add_scalar(f'Acc/{phase}', self.logs[f'{phase}_accuracy'], epoch + 1)
         self.writer.add_scalar(f'Loss/{phase}', self.logs[f'{phase}_log_loss'], epoch + 1)
-        # print(self.logs)
+        if self.verbose:
+            print(self.logs)
+
+    def save_net(self, path):
+        """ Saves policy_net parameters as given checkpoint.
+
+        state_dict of current policy_net is stored.
+
+        Args:
+            path: path were to store model's parameters.
+        """
+        save_model(self.model, path)
 
     def init_weights(self, m):
         if isinstance(m, torch.nn.Linear):
@@ -166,8 +177,8 @@ class Trainer:
 
 class IteratorParams(object):
     """Iterate over all given values of parameters."""
-    def __init__(self, model_ls, loaders_ls, criterion_ls, optim_ls, scheduler_ls, step_ls):
-        self.product = list(product(model_ls, loaders_ls, criterion_ls, optim_ls, scheduler_ls, step_ls))
+    def __init__(self, model_ls, loaders_ls, criterion_ls, optim_ls, scheduler_ls):
+        self.product = list(product(model_ls, loaders_ls, criterion_ls, optim_ls, scheduler_ls,))
         self.no_run = -1
 
     def __iter__(self):
@@ -183,7 +194,6 @@ class IteratorParams(object):
                 'criterion': tuple_run[2],
                 'optim': tuple_run[3],
                 'scheduler': tuple_run[4],
-                'step': tuple_run[5],
             }
         raise StopIteration
 
